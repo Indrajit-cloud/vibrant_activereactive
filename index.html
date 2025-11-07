@@ -1047,6 +1047,35 @@
             </button>
         </div>
 
+        <!-- Location / Simulation Controls -->
+        <div style="margin: 1rem 0; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center;">
+            <div style="background: white; padding: 0.75rem 1rem; border-radius: 0.75rem; box-shadow: var(--shadow);">
+                <strong>Location Mode:</strong>
+                <div style="margin-top: 0.5rem; display:flex; gap:0.5rem; align-items:center;">
+                    <label style="display:flex; align-items:center; gap:0.25rem;"><input type="radio" name="locMode" id="mode-real" checked> Real</label>
+                    <label style="display:flex; align-items:center; gap:0.25rem;"><input type="radio" name="locMode" id="mode-sim"> Simulate</label>
+                    <label style="display:flex; align-items:center; gap:0.25rem;"><input type="radio" name="locMode" id="mode-manual"> Manual</label>
+                </div>
+            </div>
+
+            <div id="sim-controls" style="background:white; padding:0.75rem 1rem; border-radius:0.75rem; box-shadow:var(--shadow); display:none;">
+                <strong>Simulation</strong>
+                <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+                    <button class="btn-primary" id="startSimBtn" style="padding:0.5rem 1rem; font-size:0.9rem;">Start Route</button>
+                    <button class="btn-secondary" id="stopSimBtn" style="padding:0.5rem 1rem; font-size:0.9rem;">Stop</button>
+                </div>
+            </div>
+
+            <div id="manual-controls" style="background:white; padding:0.75rem 1rem; border-radius:0.75rem; box-shadow:var(--shadow); display:none;">
+                <strong>Manual Location</strong>
+                <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+                    <input type="number" step="any" id="manualLat" placeholder="Latitude" class="form-control" style="width:140px; padding:0.5rem;" />
+                    <input type="number" step="any" id="manualLng" placeholder="Longitude" class="form-control" style="width:140px; padding:0.5rem;" />
+                    <button class="btn-primary" id="setManualBtn" style="padding:0.5rem 0.75rem; font-size:0.9rem;">Set</button>
+                </div>
+            </div>
+        </div>
+
         <div class="info-cards">
             <div class="info-card">
                 <i class="fas fa-clock"></i>
@@ -1085,13 +1114,11 @@
                     <div class="form-group">
                         <label for="hospital">Destination Hospital</label>
                         <select id="hospital" class="form-control" required>
-                            <option value="">Select Hospital</option>
-                            <option value="city-hospital">City General Hospital</option>
-                            <option value="apollo">Apollo Medical Center</option>
-                            <option value="fortis">Fortis Healthcare</option>
-                            <option value="max">Max Super Specialty Hospital</option>
-                            <option value="aiims">AIIMS Emergency</option>
+                            <option value="">Loading hospitals...</option>
                         </select>
+                        <div id="hospital-info" style="margin-top:0.5rem; font-size:0.95rem; color:var(--text-light);">
+                            Nearest hospital: <strong id="nearestHospital">—</strong>
+                        </div>
                     </div>
 
                     <div class="form-group">
@@ -1321,15 +1348,18 @@
             });
 
             userMarker = L.marker(defaultCoords, {icon: userIcon}).addTo(map);
+            // populate hospitals based on initial/default location
+            updateHospitalOptions();
             
             // Try to get user's actual location
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
-                    (position) => {
-                        const coords = [position.coords.latitude, position.coords.longitude];
-                        map.setView(coords, 13);
-                        userMarker.setLatLng(coords);
-                        document.getElementById('location-text').textContent = 'Your Current Location';
+                        (position) => {
+                            const coords = [position.coords.latitude, position.coords.longitude];
+                            map.setView(coords, 13);
+                            userMarker.setLatLng(coords);
+                            document.getElementById('location-text').textContent = 'Your Current Location';
+                            updateHospitalOptions();
                     },
                     (error) => {
                         console.log('Location access denied, using default location');
@@ -1371,8 +1401,21 @@
                 return;
             }
 
+            // find hospital object and compute distance
+            const selectedHospital = hospitals.find(h => h.id === hospital);
+            let distanceText = '';
+            try {
+                if (selectedHospital && userMarker) {
+                    const u = userMarker.getLatLng();
+                    const d = haversineKm(u.lat, u.lng, selectedHospital.lat, selectedHospital.lng);
+                    distanceText = ` (${d.toFixed(1)} km)`;
+                }
+            } catch (e) {
+                distanceText = '';
+            }
+
             closeBookingModal();
-            showToast('Ambulance booking confirmed!', 'success');
+            showToast(`Ambulance booking confirmed to ${selectedHospital ? selectedHospital.name : 'selected hospital'}${distanceText}`, 'success');
             
             setTimeout(() => {
                 openConfirmationModal();
@@ -1630,14 +1673,238 @@
             }, 3000);
         }
 
-        // Initialize app
+
+        // Geolocation & Simulation helpers
+        let watchId = null;
+        let simTimer = null;
+        let simIndex = 0;
+        // Sample simulation route (small loop around India Gate)
+        const simRoute = [
+            [28.6167, 77.2300],
+            [28.6145, 77.2330],
+            [28.6130, 77.2280],
+            [28.6115, 77.2260],
+            [28.6129, 77.2295]
+        ];
+
+        // Hospitals dataset (id, name, lat, lng)
+        const hospitals = [
+            { id: 'city-hospital', name: 'City General Hospital', lat: 28.6140, lng: 77.2290 },
+            { id: 'apollo', name: 'Apollo Medical Center', lat: 28.6195, lng: 77.2300 },
+            { id: 'fortis', name: 'Fortis Healthcare', lat: 28.6050, lng: 77.2305 },
+            { id: 'max', name: 'Max Super Specialty Hospital', lat: 28.6178, lng: 77.2250 },
+            { id: 'aiims', name: 'AIIMS Emergency', lat: 28.5676, lng: 77.2100 }
+        ];
+
+        let hospitalMarkers = [];
+
+        // Haversine distance (km)
+        function haversineKm(lat1, lon1, lat2, lon2) {
+            const toRad = v => v * Math.PI / 180;
+            const R = 6371; // km
+            const dLat = toRad(lat2 - lat1);
+            const dLon = toRad(lon2 - lon1);
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        // Populate hospital select and place markers; auto-select nearest
+        function updateHospitalOptions() {
+            const select = document.getElementById('hospital');
+            const nearestEl = document.getElementById('nearestHospital');
+            if (!select) return;
+
+            // get user position (use userMarker if exists)
+            let userLatLng = null;
+            try {
+                if (userMarker) userLatLng = userMarker.getLatLng();
+            } catch (e) { userLatLng = null; }
+
+            const userLat = userLatLng ? userLatLng.lat : null;
+            const userLng = userLatLng ? userLatLng.lng : null;
+
+            // compute distances
+            const withDist = hospitals.map(h => {
+                const d = (userLat !== null && userLng !== null) ? haversineKm(userLat, userLng, h.lat, h.lng) : Infinity;
+                return Object.assign({}, h, { distanceKm: d });
+            });
+
+            withDist.sort((a,b) => a.distanceKm - b.distanceKm);
+
+            // clear select
+            select.innerHTML = '';
+            withDist.forEach((h) => {
+                const opt = document.createElement('option');
+                opt.value = h.id;
+                opt.textContent = `${h.name} — ${isFinite(h.distanceKm) ? h.distanceKm.toFixed(1) + ' km' : '—'}`;
+                select.appendChild(opt);
+            });
+
+            // auto-select nearest (if any)
+            if (withDist.length > 0 && isFinite(withDist[0].distanceKm)) {
+                select.value = withDist[0].id;
+                nearestEl.textContent = `${withDist[0].name} — ${withDist[0].distanceKm.toFixed(1)} km`;
+            } else if (withDist.length > 0) {
+                select.value = withDist[0].id;
+                nearestEl.textContent = withDist[0].name;
+            } else {
+                nearestEl.textContent = '—';
+            }
+
+            // place/update markers
+            if (map) {
+                // remove old markers
+                hospitalMarkers.forEach(m => map.removeLayer(m));
+                hospitalMarkers = [];
+
+                withDist.forEach(h => {
+                    const marker = L.marker([h.lat, h.lng]).addTo(map);
+                    marker.bindPopup(`<strong>${h.name}</strong><br/>${isFinite(h.distanceKm) ? h.distanceKm.toFixed(1) + ' km away' : 'Distance unknown'}`);
+                    hospitalMarkers.push(marker);
+                });
+            }
+        }
+
+        function startWatchPosition() {
+            if (!navigator.geolocation) {
+                showToast('Geolocation not supported by this browser', 'error');
+                return;
+            }
+
+            // stop any existing simulation
+            stopSimulation();
+
+            if (watchId) return; // already watching
+
+            watchId = navigator.geolocation.watchPosition((position) => {
+                const coords = [position.coords.latitude, position.coords.longitude];
+                if (userMarker) userMarker.setLatLng(coords);
+                if (map) map.setView(coords, map.getZoom());
+                document.getElementById('location-text').textContent = 'Your Current Location (Real)';
+                updateHospitalOptions();
+            }, (err) => {
+                console.warn('watchPosition error', err);
+                showToast('Unable to get live location: ' + (err.message || ''), 'error');
+            }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+        }
+
+        function stopWatchPosition() {
+            if (watchId) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+                showToast('Stopped real location tracking', 'success');
+            }
+        }
+
+        function startSimulation() {
+            stopWatchPosition();
+            if (simTimer) return;
+            simIndex = 0;
+            // place marker at first point immediately
+            const first = simRoute[0];
+            if (userMarker) userMarker.setLatLng(first);
+            if (map) map.setView(first, map.getZoom());
+            document.getElementById('location-text').textContent = 'Simulated Location';
+
+            simTimer = setInterval(() => {
+                simIndex = (simIndex + 1) % simRoute.length;
+                const coords = simRoute[simIndex];
+                if (userMarker) userMarker.setLatLng(coords);
+                if (map) map.setView(coords, map.getZoom());
+                updateHospitalOptions();
+            }, 1500);
+            showToast('Simulation started', 'success');
+        }
+
+        function stopSimulation() {
+            if (simTimer) {
+                clearInterval(simTimer);
+                simTimer = null;
+                showToast('Simulation stopped', 'success');
+            }
+        }
+
+        function setManualLocation() {
+            const lat = parseFloat(document.getElementById('manualLat').value);
+            const lng = parseFloat(document.getElementById('manualLng').value);
+            if (Number.isFinite(lat) && Number.isFinite(lng)) {
+                stopWatchPosition();
+                stopSimulation();
+                const coords = [lat, lng];
+                if (userMarker) userMarker.setLatLng(coords);
+                if (map) map.setView(coords, 13);
+                document.getElementById('location-text').textContent = 'Manual Location';
+                updateHospitalOptions();
+                showToast('Manual location set', 'success');
+            } else {
+                showToast('Please enter valid latitude and longitude', 'error');
+            }
+        }
+
+        function setModeUI(mode) {
+            document.getElementById('sim-controls').style.display = (mode === 'sim') ? 'block' : 'none';
+            document.getElementById('manual-controls').style.display = (mode === 'manual') ? 'block' : 'none';
+
+            if (mode === 'real') {
+                startWatchPosition();
+            } else {
+                stopWatchPosition();
+            }
+
+            if (mode === 'sim') {
+                // do not auto-start; wait for user to click Start Route
+            }
+        }
+
+        // wire UI events
         document.addEventListener('DOMContentLoaded', () => {
             initMap();
-            
-            // Welcome message
+
+            // initial mode: real
+            setModeUI('real');
+
+            // welcome message
             setTimeout(() => {
                 showToast('Welcome to AmbuQuick! Emergency services at your fingertips.', 'success');
             }, 1000);
+
+            // radio buttons
+            document.getElementById('mode-real').addEventListener('change', () => setModeUI('real'));
+            document.getElementById('mode-sim').addEventListener('change', () => setModeUI('sim'));
+            document.getElementById('mode-manual').addEventListener('change', () => setModeUI('manual'));
+
+            // simulation buttons
+            document.getElementById('startSimBtn').addEventListener('click', () => startSimulation());
+            document.getElementById('stopSimBtn').addEventListener('click', () => stopSimulation());
+
+            // manual set
+            document.getElementById('setManualBtn').addEventListener('click', (e) => {
+                e.preventDefault();
+                setManualLocation();
+            });
+
+            // when user picks a hospital, update the small info display to show chosen distance
+            const hospitalSelect = document.getElementById('hospital');
+            if (hospitalSelect) {
+                hospitalSelect.addEventListener('change', () => {
+                    const sel = hospitals.find(h => h.id === hospitalSelect.value);
+                    const nearestEl = document.getElementById('nearestHospital');
+                    if (sel && userMarker) {
+                        try {
+                            const u = userMarker.getLatLng();
+                            const d = haversineKm(u.lat, u.lng, sel.lat, sel.lng);
+                            nearestEl.textContent = `${sel.name} — ${d.toFixed(1)} km`;
+                        } catch (e) {
+                            nearestEl.textContent = sel.name;
+                        }
+                    } else if (sel) {
+                        nearestEl.textContent = sel.name;
+                    }
+                });
+            }
         });
 
         // Prevent modal from closing when clicking inside
